@@ -3,92 +3,131 @@ package main
 import (
 	"bufio"
 	"fmt"
-	"log"
 	"net"
+	"strconv"
 	"strings"
 	"time"
 )
 
-func main() {
-	servers := []string{
-		"datafeed1.cedrotech.com:81",
-		"datafeed2.cedrotech.com:81",
-	}
+var (
+	errorIndex2NotFound = fmt.Errorf("index 2 not found in message")
+)
 
+func main() {
+	// Replace with actual host, port, username, and password
+	host := "datafeed1.cedrotech.com"
+	port := "81"
 	username := "username"
 	password := "password"
-	ativo := "petr4"
+	tickerMessage := "sqt petr4"
 
-	var conn net.Conn
-	var err error
-
-	// Try connecting to servers indefinitely
-	for {
-		for _, server := range servers {
-			fmt.Printf("Attempting to connect to server: %s\n", server)
-			conn, err = net.Dial("tcp", server)
-			if err == nil {
-				fmt.Printf("Connected to server: %s\n", server)
-				break
-			}
-			fmt.Printf("Failed to connect to server: %s, error: %v\n", server, err)
-		}
-
-		if conn != nil && err == nil {
-			break
-		}
-
-		fmt.Println("All servers failed. Retrying...")
-		time.Sleep(2 * time.Second) // Optional sleep before retrying
+	// Connect to the socket
+	conn, err := net.Dial("tcp", fmt.Sprintf("%s:%s", host, port))
+	if err != nil {
+		panic(fmt.Sprintf("Failed to connect to socket: %v", err))
 	}
 	defer conn.Close()
 
-	// Initialize reader and writer for the connection
+	fmt.Println("Connected to the socket.")
 	reader := bufio.NewReader(conn)
-	writer := bufio.NewWriter(conn)
 
-	// Authenticate
-	fmt.Fprintln(writer, username)
-	writer.Flush()
-
-	fmt.Fprintln(writer, password)
-	writer.Flush()
-
-	// Wait for "You are connected" confirmation
+	// Main loop to handle connection flow
 	for {
-		response, err := reader.ReadString('\n')
+		message := readNonIgnoredMessage(reader)
+
+		// Connection flow and message handling
+		switch {
+		case message == "Connecting...":
+			// Respond with an empty message
+			sendMessage(conn, "")
+
+		case message == "Welcome to Cedro Crystal":
+			// Ignore this message
+
+		case message == "Username:":
+			// Respond with the username
+			sendMessage(conn, username)
+
+		case message == "Password:":
+			// Respond with the password
+			sendMessage(conn, password)
+
+		case message == "You are connected":
+			// Respond with the listening command
+			sendMessage(conn, tickerMessage)
+			fmt.Println("Authentication successful. Listening for messages...")
+
+		default:
+			// Handle and format index-value messages
+			if strings.HasPrefix(message, "T:WDOF25:") {
+				ticker, parsedTime, value, err := parseMessage(message)
+				if err == nil {
+					fmt.Printf("%s (%s): %f\n", ticker, parsedTime.Format("15:04:05"), value)
+				} else {
+					if err == errorIndex2NotFound {
+						continue
+					}
+					fmt.Printf("Skipping message: %s (Error: %v)\n", message, err)
+				}
+			}
+		}
+	}
+}
+
+// sendMessage sends a message to the socket connection
+func sendMessage(conn net.Conn, message string) {
+	_, err := conn.Write([]byte(message + "\n"))
+	if err != nil {
+		panic(fmt.Sprintf("Failed to send message: %v", err))
+	}
+}
+
+// readNonIgnoredMessage reads a message from the connection and ignores blank lines, "SYN", or newline-only messages
+func readNonIgnoredMessage(reader *bufio.Reader) string {
+	for {
+		line, err := reader.ReadString('\n')
 		if err != nil {
-			log.Fatalf("Error reading response: %v", err)
+			panic(fmt.Sprintf("Error reading from socket: %v", err))
 		}
-		fmt.Print("Server: ", response)
-		if strings.Contains(response, "You are connected") {
-			fmt.Println("Authentication successful")
-			break
+		line = strings.TrimSpace(line)
+		if line == "" || line == "SYN" {
+			// Ignore empty messages, break lines, and SYN
+			continue
 		}
+		return line
+	}
+}
+
+// parseMessage parses the incoming message and extracts the ticker, formatted time, and value for index 2.
+func parseMessage(message string) (string, time.Time, float64, error) {
+	// Messages are separated by ':', and we are looking for "2:value" pairs.
+	parts := strings.Split(message, ":")
+	if len(parts) < 4 {
+		return "", time.Time{}, 0, fmt.Errorf("invalid message format")
 	}
 
-	// Subscribe to asset using the SQT command
-	sqtCommand := fmt.Sprintf("sqt %s", ativo)
-	fmt.Fprintln(writer, sqtCommand)
-	writer.Flush()
-	fmt.Printf("Subscribed to asset: %s\n", ativo)
+	// Extract the ticker and time
+	ticker := parts[1]
+	rawTime := parts[2]
 
-	// Read and process incoming messages
-	go func() {
-		for {
-			response, err := reader.ReadString('\n')
+	// Parse the time into time.Time format (assuming BRT time zone)
+	parsedTime, err := time.Parse("150405", rawTime)
+	if err != nil {
+		return "", time.Time{}, 0, fmt.Errorf("invalid time format: %v", err)
+	}
+
+	// Search for index 2 and extract its value
+	for i := 3; i < len(parts)-1; i += 2 {
+		index := parts[i]
+		if index == "2" && i+1 < len(parts) {
+			valueStr := parts[i+1]
+			value, err := strconv.ParseFloat(valueStr, 64)
 			if err != nil {
-				log.Fatalf("Error reading data: %v", err)
+				return "", time.Time{}, 0, fmt.Errorf("invalid value for index 2: %v", err)
 			}
-			if strings.TrimSpace(response) == "" {
-				continue
-			}
-			fmt.Println("Message: ", response)
+			return ticker, parsedTime, value / 1000, nil
 		}
-	}()
-
-	// Keep the connection alive
-	for {
-		time.Sleep(1 * time.Second)
 	}
+
+	return "", time.Time{}, 0, errorIndex2NotFound
 }
